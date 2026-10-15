@@ -40,3 +40,7 @@ htmlcov/
 # OS-generated files
 .DS_Store
 Thumbs.db
+# Test files and transfer folders
+big.bin
+**/files/*
+**/downloads/*
