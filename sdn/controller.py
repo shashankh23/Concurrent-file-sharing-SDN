@@ -1,3 +1,4 @@
+
 import os
 import time
 
@@ -18,29 +19,54 @@ class FileSharingController(app_manager.OSKenApp):
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
-    # Project network configuration
+    # -----------------------------------------
+    # PROJECT CONFIGURATION
+    # -----------------------------------------
+
     CLIENT_TO_BLOCK = "10.0.0.3"
     SERVER_IP = "10.0.0.4"
     SERVER_PORT = 5000
+
+    # Switch s1
     CLIENT_SWITCH_DPID = 1
 
-    # Simple local demonstration control channel
+    # Local demonstration command file
     POLICY_FILE = "/tmp/sdn_policy_command.txt"
+
+    # Traffic monitoring configuration
+    MONITOR_INTERVAL = 5
+
+    # Bottleneck link configuration
+    LINK_BANDWIDTH_MBPS = 10.0
+    CONGESTION_THRESHOLD_MBPS = 8.0
+
+    # Ports on the inter-switch link
+    # Confirm these using "net" in Mininet
+    BOTTLENECK_PORTS = {
+        (1, 4),  # s1 port 4
+        (2, 1)   # s2 port 1
+    }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # Learning switch information
         self.mac_to_port = {}
+
+        # Connected OpenFlow switches
         self.datapaths = {}
+
+        # Previous traffic statistics
         self.previous_stats = {}
 
-        # Current blocking policy
+        # Current dynamic blocking policy
         self.blocked = False
 
-        # Avoid executing a command left by an old run
+        # Clear commands from previous runs
         if os.path.exists(self.POLICY_FILE):
             os.remove(self.POLICY_FILE)
 
+        # Start monitoring tasks
         self.monitor_thread = hub.spawn(self.monitor)
         self.policy_thread = hub.spawn(self.policy_monitor)
 
@@ -49,7 +75,7 @@ class FileSharingController(app_manager.OSKenApp):
         )
 
     # -----------------------------------------
-    # OPENFLOW SWITCH INITIALIZATION
+    # SWITCH INITIALIZATION
     # -----------------------------------------
 
     @set_ev_cls(
@@ -57,16 +83,20 @@ class FileSharingController(app_manager.OSKenApp):
         CONFIG_DISPATCHER
     )
     def switch_features_handler(self, ev):
+
         dp = ev.msg.datapath
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
         self.logger.info(
-            "[SWITCH] Connected: %s", dp.id
+            "[SWITCH] Connected: %s",
+            dp.id
         )
 
-        # Unmatched packets go to controller
+        # Table-miss rule:
+        # Send unmatched packets to controller
         match = parser.OFPMatch()
+
         actions = [
             parser.OFPActionOutput(
                 ofproto.OFPP_CONTROLLER,
@@ -76,15 +106,19 @@ class FileSharingController(app_manager.OSKenApp):
 
         self.add_flow(dp, 0, match, actions)
 
-        # Restore policy if switch reconnects
-        if self.blocked and dp.id == self.CLIENT_SWITCH_DPID:
+        # Restore blocking policy after reconnect
+        if (
+            self.blocked
+            and dp.id == self.CLIENT_SWITCH_DPID
+        ):
             self.install_block_rule(dp)
 
     # -----------------------------------------
-    # INSTALL FORWARDING FLOW
+    # INSTALL OPENFLOW RULE
     # -----------------------------------------
 
     def add_flow(self, dp, priority, match, actions):
+
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
@@ -105,7 +139,7 @@ class FileSharingController(app_manager.OSKenApp):
         dp.send_msg(mod)
 
     # -----------------------------------------
-    # MAC LEARNING AND PACKET FORWARDING
+    # LEARNING SWITCH FUNCTIONALITY
     # -----------------------------------------
 
     @set_ev_cls(
@@ -113,8 +147,10 @@ class FileSharingController(app_manager.OSKenApp):
         MAIN_DISPATCHER
     )
     def packet_in_handler(self, ev):
+
         msg = ev.msg
         dp = msg.datapath
+
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
@@ -127,6 +163,7 @@ class FileSharingController(app_manager.OSKenApp):
         if eth is None:
             return
 
+        # Ignore LLDP packets
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
 
@@ -134,23 +171,38 @@ class FileSharingController(app_manager.OSKenApp):
         dst = eth.dst
 
         self.mac_to_port.setdefault(dpid, {})
+
+        # Learn source MAC and incoming port
         self.mac_to_port[dpid][src] = in_port
 
+        # Find destination port
         out_port = self.mac_to_port[dpid].get(
             dst,
             ofproto.OFPP_FLOOD
         )
 
-        actions = [parser.OFPActionOutput(out_port)]
+        actions = [
+            parser.OFPActionOutput(out_port)
+        ]
 
+        # Install learned forwarding rule
         if out_port != ofproto.OFPP_FLOOD:
+
             match = parser.OFPMatch(
                 in_port=in_port,
                 eth_dst=dst
             )
-            self.add_flow(dp, 1, match, actions)
 
+            self.add_flow(
+                dp,
+                1,
+                match,
+                actions
+            )
+
+        # Forward current packet
         data = None
+
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
 
@@ -173,39 +225,55 @@ class FileSharingController(app_manager.OSKenApp):
         [MAIN_DISPATCHER, DEAD_DISPATCHER]
     )
     def state_change_handler(self, ev):
+
         dp = ev.datapath
 
         if ev.state == MAIN_DISPATCHER:
-            self.datapaths[dp.id] = dp
 
-            self.logger.info(
-                "[MONITOR] Switch %s registered", dp.id
-            )
+            if dp.id not in self.datapaths:
+
+                self.datapaths[dp.id] = dp
+
+                self.logger.info(
+                    "[MONITOR] Switch %s registered",
+                    dp.id
+                )
 
         elif ev.state == DEAD_DISPATCHER:
+
             self.datapaths.pop(dp.id, None)
             self.mac_to_port.pop(dp.id, None)
 
+            # Clear old statistics
             for key in list(self.previous_stats):
+
                 if key[0] == dp.id:
                     del self.previous_stats[key]
 
             self.logger.info(
-                "[MONITOR] Switch %s disconnected", dp.id
+                "[MONITOR] Switch %s disconnected",
+                dp.id
             )
 
     # -----------------------------------------
-    # PERIODIC PORT STATISTICS MONITORING
+    # PERIODIC TRAFFIC MONITORING
     # -----------------------------------------
 
     def monitor(self):
+
         while True:
+
             for dp in list(self.datapaths.values()):
                 self.request_stats(dp)
 
-            hub.sleep(5)
+            hub.sleep(self.MONITOR_INTERVAL)
+
+    # -----------------------------------------
+    # REQUEST PORT STATISTICS
+    # -----------------------------------------
 
     def request_stats(self, dp):
+
         parser = dp.ofproto_parser
         ofproto = dp.ofproto
 
@@ -217,30 +285,40 @@ class FileSharingController(app_manager.OSKenApp):
 
         dp.send_msg(request)
 
+    # -----------------------------------------
+    # PROCESS TRAFFIC STATISTICS
+    # -----------------------------------------
+
     @set_ev_cls(
         ofp_event.EventOFPPortStatsReply,
         MAIN_DISPATCHER
     )
     def port_stats_reply_handler(self, ev):
+
         dp = ev.msg.datapath
         dpid = dp.id
 
         now = time.monotonic()
 
         for stat in ev.msg.body:
+
+            # Ignore reserved OpenFlow ports
             if stat.port_no > 0xFFFFFF00:
                 continue
 
             key = (dpid, stat.port_no)
+
             rx_bytes = stat.rx_bytes
             tx_bytes = stat.tx_bytes
 
             previous = self.previous_stats.get(key)
 
             if previous is not None:
+
                 old_rx, old_tx, old_time = previous
 
                 elapsed = now - old_time
+
                 delta_rx = rx_bytes - old_rx
                 delta_tx = tx_bytes - old_tx
 
@@ -249,13 +327,21 @@ class FileSharingController(app_manager.OSKenApp):
                     and delta_rx >= 0
                     and delta_tx >= 0
                 ):
+
+                    # Calculate traffic rates
                     rx_mbps = (
-                        delta_rx * 8 / elapsed / 1_000_000
-                    )
-                    tx_mbps = (
-                        delta_tx * 8 / elapsed / 1_000_000
+                        delta_rx * 8
+                        / elapsed
+                        / 1_000_000
                     )
 
+                    tx_mbps = (
+                        delta_tx * 8
+                        / elapsed
+                        / 1_000_000
+                    )
+
+                    # General traffic monitoring
                     self.logger.info(
                         "[TRAFFIC] Switch=%s Port=%s "
                         "RX=%.3f Mbps TX=%.3f Mbps "
@@ -268,6 +354,43 @@ class FileSharingController(app_manager.OSKenApp):
                         stat.tx_packets
                     )
 
+                    # ---------------------------------
+                    # CONGESTION DETECTION
+                    # ---------------------------------
+
+                    if (
+                        (dpid, stat.port_no)
+                        in self.BOTTLENECK_PORTS
+                    ):
+
+                        traffic_rate = max(
+                            rx_mbps,
+                            tx_mbps
+                        )
+
+                        utilization = (
+                            traffic_rate
+                            / self.LINK_BANDWIDTH_MBPS
+                        ) * 100
+
+                        if (
+                            traffic_rate
+                            >= self.CONGESTION_THRESHOLD_MBPS
+                        ):
+
+                            self.logger.warning(
+                                "[CONGESTION] "
+                                "Switch=%s Port=%s "
+                                "Rate=%.2f Mbps "
+                                "Utilization=%.1f%% "
+                                "Threshold exceeded!",
+                                dpid,
+                                stat.port_no,
+                                traffic_rate,
+                                utilization
+                            )
+
+            # Save counters for next interval
             self.previous_stats[key] = (
                 rx_bytes,
                 tx_bytes,
@@ -275,10 +398,11 @@ class FileSharingController(app_manager.OSKenApp):
             )
 
     # -----------------------------------------
-    # TCP PORT 5000 BLOCK RULE
+    # TCP BLOCKING RULE
     # -----------------------------------------
 
     def block_match(self, dp):
+
         parser = dp.ofproto_parser
 
         return parser.OFPMatch(
@@ -289,12 +413,22 @@ class FileSharingController(app_manager.OSKenApp):
             tcp_dst=self.SERVER_PORT
         )
 
+    # -----------------------------------------
+    # INSTALL BLOCK RULE
+    # -----------------------------------------
+
     def install_block_rule(self, dp):
+
         match = self.block_match(dp)
 
-        # No output actions = DROP
-        # Priority 100 overrides learning flows at 1
-        self.add_flow(dp, 100, match, [])
+        # Empty actions = DROP
+        # Priority 100 overrides learning rules
+        self.add_flow(
+            dp,
+            100,
+            match,
+            []
+        )
 
         self.logger.info(
             "[POLICY] BLOCK rule sent to switch %s: "
@@ -305,13 +439,17 @@ class FileSharingController(app_manager.OSKenApp):
             self.SERVER_PORT
         )
 
+    # -----------------------------------------
+    # REMOVE BLOCK RULE
+    # -----------------------------------------
+
     def remove_block_rule(self, dp):
+
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
         match = self.block_match(dp)
 
-        # Remove only this exact priority-100 rule
         mod = parser.OFPFlowMod(
             datapath=dp,
             command=ofproto.OFPFC_DELETE_STRICT,
@@ -324,24 +462,34 @@ class FileSharingController(app_manager.OSKenApp):
         dp.send_msg(mod)
 
         self.logger.info(
-            "[POLICY] UNBLOCK rule removal sent to switch %s",
+            "[POLICY] UNBLOCK rule removal sent "
+            "to switch %s",
             dp.id
         )
 
     # -----------------------------------------
-    # DYNAMIC POLICY CONTROL
+    # DYNAMIC POLICY COMMAND MONITOR
     # -----------------------------------------
 
     def policy_monitor(self):
+
         while True:
+
             try:
+
                 if os.path.isfile(self.POLICY_FILE):
-                    with open(self.POLICY_FILE, "r") as f:
+
+                    with open(
+                        self.POLICY_FILE,
+                        "r"
+                    ) as f:
+
                         command = f.read().strip().upper()
 
                     os.remove(self.POLICY_FILE)
 
                     if command == "BLOCK":
+
                         self.blocked = True
 
                         dp = self.datapaths.get(
@@ -350,12 +498,14 @@ class FileSharingController(app_manager.OSKenApp):
 
                         if dp is not None:
                             self.install_block_rule(dp)
+
                         else:
                             self.logger.warning(
-                                "[POLICY] s1 is not connected"
+                                "[POLICY] s1 not connected"
                             )
 
                     elif command == "UNBLOCK":
+
                         self.blocked = False
 
                         dp = self.datapaths.get(
@@ -364,26 +514,31 @@ class FileSharingController(app_manager.OSKenApp):
 
                         if dp is not None:
                             self.remove_block_rule(dp)
+
                         else:
                             self.logger.warning(
-                                "[POLICY] s1 is not connected"
+                                "[POLICY] s1 not connected"
                             )
 
                     elif command == "STATUS":
+
                         self.logger.info(
                             "[POLICY] Blocking enabled: %s",
                             self.blocked
                         )
 
                     else:
+
                         self.logger.warning(
                             "[POLICY] Unknown command: %s",
                             command
                         )
 
             except OSError as error:
+
                 self.logger.error(
-                    "[POLICY] File error: %s", error
+                    "[POLICY] File error: %s",
+                    error
                 )
 
             hub.sleep(1)
