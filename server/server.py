@@ -2,9 +2,10 @@
 
 Run:  python server.py [port]
 Protocol (text commands end with newline):
-  LOGIN user pass        -> AUTH_OK / AUTH_FAIL
-  LIST                   -> FILE_LIST n, then n filenames
+  LOGIN user pass        -> AUTH_OK / AUTH_FAIL (checked against the database)
+  LIST                   -> FILE_LIST n, then n lines "name | owner | size | time"
   UPLOAD name size       -> READY, (client sends bytes), UPLOAD_OK
+                            (ERROR Permission denied if the user may not upload)
   DOWNLOAD name          -> FILE_INFO size, (server sends bytes) / ERROR ...
   QUIT                   -> BYE
 Filenames must not contain spaces.
@@ -15,14 +16,15 @@ import sys
 import threading
 import time
 
+import authentication
+import metadata
+from database import database as db
+
 HOST = "0.0.0.0"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILES_DIR = os.path.join(BASE_DIR, "files")
+FILES_DIR = os.environ.get("FILESHARE_FILES_DIR", os.path.join(BASE_DIR, "files"))
 CHUNK = 4096
-
-# Placeholder users. Person 3 will replace this with the database.
-USERS = {"alice": "1234", "bob": "abcd"}
 
 
 def send_line(conn, text):
@@ -32,8 +34,9 @@ def send_line(conn, text):
 def handle_client(conn, addr):
     print(f"[CONNECT] {addr}")
     rfile = conn.makefile("rb")
+    ip = addr[0]
     logged_in = False
-    user = None
+    user = None          # database row of the logged-in user
     try:
         while True:
             line = rfile.readline()
@@ -45,13 +48,21 @@ def handle_client(conn, addr):
             cmd = parts[0].upper()
 
             if cmd == "LOGIN":
-                if len(parts) == 3 and USERS.get(parts[1]) == parts[2]:
+                if len(parts) != 3:
+                    send_line(conn, "AUTH_FAIL")
+                    continue
+                result = authentication.authenticate(parts[1], parts[2], ip)
+                if result.ok:
                     logged_in = True
-                    user = parts[1]
+                    user = result.user
                     send_line(conn, "AUTH_OK")
-                    print(f"[LOGIN] {user} from {addr}")
+                    print(f"[LOGIN] {parts[1]} from {addr}")
+                elif result.reason == "locked":
+                    send_line(conn, "AUTH_FAIL Too many failed attempts, try later")
+                    print(f"[LOGIN] refused (locked out) {ip}")
                 else:
                     send_line(conn, "AUTH_FAIL")
+                    print(f"[LOGIN] failed for '{parts[1]}' from {addr}")
 
             elif cmd == "QUIT":
                 send_line(conn, "BYE")
@@ -61,10 +72,10 @@ def handle_client(conn, addr):
                 send_line(conn, "ERROR Please login first")
 
             elif cmd == "LIST":
-                names = sorted(os.listdir(FILES_DIR))
-                send_line(conn, f"FILE_LIST {len(names)}")
-                for n in names:
-                    send_line(conn, n)
+                rows = metadata.list_files(FILES_DIR)
+                send_line(conn, f"FILE_LIST {len(rows)}")
+                for row in rows:
+                    send_line(conn, metadata.format_row(row))
 
             elif cmd == "UPLOAD":
                 if len(parts) != 3 or not parts[2].isdigit():
@@ -72,11 +83,25 @@ def handle_client(conn, addr):
                     continue
                 name = os.path.basename(parts[1])
                 size = int(parts[2])
+                username = user["username"]
+                if not authentication.check_permission(user, "upload"):
+                    db.log_event("DENIED", username, ip, f"upload {name}")
+                    send_line(conn, "ERROR Permission denied: upload")
+                    continue
+                owner = metadata.get_owner(name)
+                if not authentication.can_overwrite(user, owner):
+                    db.log_event("DENIED", username, ip,
+                                 f"overwrite {name} owned by {owner}")
+                    send_line(conn, f"ERROR File is owned by {owner}")
+                    continue
                 path = os.path.join(FILES_DIR, name)
+                # Write to a temporary file so a cut-off upload never destroys
+                # an existing file; rename only when complete.
+                tmp_path = f"{path}.{threading.get_ident()}.part"
                 send_line(conn, "READY")
                 start = time.time()
                 remaining = size
-                with open(path, "wb") as f:
+                with open(tmp_path, "wb") as f:
                     while remaining > 0:
                         data = rfile.read(min(CHUNK, remaining))
                         if not data:
@@ -84,12 +109,14 @@ def handle_client(conn, addr):
                         f.write(data)
                         remaining -= len(data)
                 if remaining > 0:
-                    os.remove(path)
+                    os.remove(tmp_path)
                     print(f"[ERROR] Upload of {name} from {addr} was cut off")
                     break
+                os.replace(tmp_path, path)
                 elapsed = max(time.time() - start, 1e-6)
+                metadata.record_upload(name, username, size, elapsed, ip)
                 send_line(conn, "UPLOAD_OK")
-                print(f"[UPLOAD] {user} {name} {size} bytes in {elapsed:.2f}s "
+                print(f"[UPLOAD] {username} {name} {size} bytes in {elapsed:.2f}s "
                       f"({size / elapsed / 1e6:.2f} MB/s)")
 
             elif cmd == "DOWNLOAD":
@@ -97,6 +124,11 @@ def handle_client(conn, addr):
                     send_line(conn, "ERROR Usage: DOWNLOAD name")
                     continue
                 name = os.path.basename(parts[1])
+                username = user["username"]
+                if not authentication.check_permission(user, "download"):
+                    db.log_event("DENIED", username, ip, f"download {name}")
+                    send_line(conn, "ERROR Permission denied: download")
+                    continue
                 path = os.path.join(FILES_DIR, name)
                 if not os.path.isfile(path):
                     send_line(conn, "ERROR File not found")
@@ -111,7 +143,8 @@ def handle_client(conn, addr):
                             break
                         conn.sendall(data)
                 elapsed = max(time.time() - start, 1e-6)
-                print(f"[DOWNLOAD] {user} {name} {size} bytes in {elapsed:.2f}s "
+                metadata.record_download(name, username, size, elapsed, ip)
+                print(f"[DOWNLOAD] {username} {name} {size} bytes in {elapsed:.2f}s "
                       f"({size / elapsed / 1e6:.2f} MB/s)")
 
             else:
@@ -126,6 +159,7 @@ def handle_client(conn, addr):
 
 def main():
     os.makedirs(FILES_DIR, exist_ok=True)
+    db.init_db()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))

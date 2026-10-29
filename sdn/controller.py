@@ -1,4 +1,5 @@
 
+import ipaddress
 import os
 import time
 
@@ -59,8 +60,8 @@ class FileSharingController(app_manager.OSKenApp):
         # Previous traffic statistics
         self.previous_stats = {}
 
-        # Current dynamic blocking policy
-        self.blocked = False
+        # IPs currently blocked from reaching the file server
+        self.blocked_ips = set()
 
         # Clear commands from previous runs
         if os.path.exists(self.POLICY_FILE):
@@ -107,11 +108,9 @@ class FileSharingController(app_manager.OSKenApp):
         self.add_flow(dp, 0, match, actions)
 
         # Restore blocking policy after reconnect
-        if (
-            self.blocked
-            and dp.id == self.CLIENT_SWITCH_DPID
-        ):
-            self.install_block_rule(dp)
+        if dp.id == self.CLIENT_SWITCH_DPID:
+            for ip in self.blocked_ips:
+                self.install_block_rule(dp, ip)
 
     # -----------------------------------------
     # INSTALL OPENFLOW RULE
@@ -401,14 +400,14 @@ class FileSharingController(app_manager.OSKenApp):
     # TCP BLOCKING RULE
     # -----------------------------------------
 
-    def block_match(self, dp):
+    def block_match(self, dp, ip):
 
         parser = dp.ofproto_parser
 
         return parser.OFPMatch(
             eth_type=0x0800,
             ip_proto=6,
-            ipv4_src=self.CLIENT_TO_BLOCK,
+            ipv4_src=ip,
             ipv4_dst=self.SERVER_IP,
             tcp_dst=self.SERVER_PORT
         )
@@ -417,9 +416,9 @@ class FileSharingController(app_manager.OSKenApp):
     # INSTALL BLOCK RULE
     # -----------------------------------------
 
-    def install_block_rule(self, dp):
+    def install_block_rule(self, dp, ip):
 
-        match = self.block_match(dp)
+        match = self.block_match(dp, ip)
 
         # Empty actions = DROP
         # Priority 100 overrides learning rules
@@ -434,7 +433,7 @@ class FileSharingController(app_manager.OSKenApp):
             "[POLICY] BLOCK rule sent to switch %s: "
             "%s -> %s TCP/%s",
             dp.id,
-            self.CLIENT_TO_BLOCK,
+            ip,
             self.SERVER_IP,
             self.SERVER_PORT
         )
@@ -443,12 +442,12 @@ class FileSharingController(app_manager.OSKenApp):
     # REMOVE BLOCK RULE
     # -----------------------------------------
 
-    def remove_block_rule(self, dp):
+    def remove_block_rule(self, dp, ip):
 
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
-        match = self.block_match(dp)
+        match = self.block_match(dp, ip)
 
         mod = parser.OFPFlowMod(
             datapath=dp,
@@ -469,7 +468,73 @@ class FileSharingController(app_manager.OSKenApp):
 
     # -----------------------------------------
     # DYNAMIC POLICY COMMAND MONITOR
+    #
+    # Commands are read from POLICY_FILE, one per line:
+    #   BLOCK [ip]     drop ip -> server TCP/5000 (default CLIENT_TO_BLOCK)
+    #   UNBLOCK [ip]   remove that rule
+    #   STATUS         log the blocked IPs
+    # Written by hand during the demo, or by the file server
+    # (server/sdn_bridge.py) after repeated failed logins.
     # -----------------------------------------
+
+    def handle_policy_command(self, line):
+
+        parts = line.split()
+
+        if not parts:
+            return
+
+        command = parts[0].upper()
+
+        ip = parts[1] if len(parts) > 1 else self.CLIENT_TO_BLOCK
+
+        if command in ("BLOCK", "UNBLOCK"):
+
+            try:
+                ipaddress.IPv4Address(ip)
+
+            except ValueError:
+                self.logger.warning(
+                    "[POLICY] Invalid IP address: %s",
+                    ip
+                )
+                return
+
+        dp = self.datapaths.get(self.CLIENT_SWITCH_DPID)
+
+        if command == "BLOCK":
+
+            self.blocked_ips.add(ip)
+
+            if dp is not None:
+                self.install_block_rule(dp, ip)
+
+            else:
+                self.logger.warning("[POLICY] s1 not connected")
+
+        elif command == "UNBLOCK":
+
+            self.blocked_ips.discard(ip)
+
+            if dp is not None:
+                self.remove_block_rule(dp, ip)
+
+            else:
+                self.logger.warning("[POLICY] s1 not connected")
+
+        elif command == "STATUS":
+
+            self.logger.info(
+                "[POLICY] Blocked IPs: %s",
+                sorted(self.blocked_ips)
+            )
+
+        else:
+
+            self.logger.warning(
+                "[POLICY] Unknown command: %s",
+                line
+            )
 
     def policy_monitor(self):
 
@@ -484,55 +549,12 @@ class FileSharingController(app_manager.OSKenApp):
                         "r"
                     ) as f:
 
-                        command = f.read().strip().upper()
+                        lines = f.read().splitlines()
 
                     os.remove(self.POLICY_FILE)
 
-                    if command == "BLOCK":
-
-                        self.blocked = True
-
-                        dp = self.datapaths.get(
-                            self.CLIENT_SWITCH_DPID
-                        )
-
-                        if dp is not None:
-                            self.install_block_rule(dp)
-
-                        else:
-                            self.logger.warning(
-                                "[POLICY] s1 not connected"
-                            )
-
-                    elif command == "UNBLOCK":
-
-                        self.blocked = False
-
-                        dp = self.datapaths.get(
-                            self.CLIENT_SWITCH_DPID
-                        )
-
-                        if dp is not None:
-                            self.remove_block_rule(dp)
-
-                        else:
-                            self.logger.warning(
-                                "[POLICY] s1 not connected"
-                            )
-
-                    elif command == "STATUS":
-
-                        self.logger.info(
-                            "[POLICY] Blocking enabled: %s",
-                            self.blocked
-                        )
-
-                    else:
-
-                        self.logger.warning(
-                            "[POLICY] Unknown command: %s",
-                            command
-                        )
+                    for line in lines:
+                        self.handle_policy_command(line.strip())
 
             except OSError as error:
 
